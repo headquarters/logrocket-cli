@@ -1,12 +1,15 @@
-import { createServer } from 'http';
+import { createServer as httpsCreateServer } from 'https';
+import { createServer as httpCreateServer } from 'http';
 import { exec } from 'child_process';
 import { parse } from 'url';
 import getRawBody from 'raw-body';
+import httpProxy from 'http-proxy';
+import fs from 'fs';
 
 const CLI_INDEX = './bin/logrocket';
 const FIXTURE_PATH = './test/fixtures/';
 
-const executeCommand = async (cmd, { env = '' } = {}) => {
+const executeCommand = async (cmd, { env = 'HTTP_PROXY="" HTTPS_PROXY=""' } = {}) => {
   return new Promise(resolve => {
     exec(
       `${env} ${CLI_INDEX} ${cmd}`,
@@ -21,9 +24,12 @@ describe('CLI dispatch tests', function cliTests() {
   this.timeout(30000);
 
   let server;
+  let proxyServer;
   let expectRequests;
+  let expectProxyRequests;
   let unmatchedRequests;
   let matchedRequests;
+  let matchedProxyRequests;
 
   const addExpectRequest = (url, opts) => {
     expectRequests[url] = {
@@ -33,21 +39,42 @@ describe('CLI dispatch tests', function cliTests() {
     };
   };
 
-  const addCliStatusMessage = ({ message = '', status = 204 } = {}) => {
+  const addExpectProxyRequest = (url, opts) => {
+    expectProxyRequests[url] = {
+      body: {},
+      status: 200,
+      ...opts,
+    };
+  };
+
+  const addCliStatusMessage = ({ message = '', status = 204, includeProxy = false } = {}) => {
     addExpectRequest('/cli/status/', {
       status: (status === 204 && message !== '') ? 200 : status,
       body: { message },
     });
+
+    if (includeProxy) {
+      addExpectProxyRequest('/cli/status/', {
+        status: (status === 204 && message !== '') ? 200 : status,
+        body: { message },
+      });
+    }
   };
 
   const resetRequestCapture = () => {
     expectRequests = {};
+    expectProxyRequests = {};
     unmatchedRequests = [];
     matchedRequests = [];
+    matchedProxyRequests = [];
   };
 
   before(() => {
-    server = createServer(async (req, res) => {
+    server = httpsCreateServer({
+      rejectUnauthorized: false,
+      key: fs.readFileSync('./test/fixtures/server.key'),
+      cert: fs.readFileSync('./test/fixtures/server.cert')
+    }, async (req, res) => {
       const parts = parse(req.url);
 
       if (expectRequests[parts.pathname]) {
@@ -71,10 +98,31 @@ describe('CLI dispatch tests', function cliTests() {
     });
 
     server.listen(8818);
+
+    const proxy = httpProxy.createProxyServer({ });
+
+    proxyServer = httpCreateServer(function (req, res) {
+      const parts = parse(req.url);
+
+      if (expectProxyRequests[parts.pathname]) {
+        matchedProxyRequests.push(req);
+        proxy.web(req, res, { target: 'https://localhost:8818', rejectUnauthorized: false, secure: false });
+      } else {
+        unmatchedRequests.push(req);
+
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end();
+      }
+    });
+
+    proxyServer.listen('9818');
+
+
   });
 
   after(() => {
     server.close();
+    proxyServer.close();
   });
 
   beforeEach(() => {
@@ -137,7 +185,7 @@ describe('CLI dispatch tests', function cliTests() {
   }));
 
   it('should error if no release version is passed', mochaAsync(async () => {
-    const result = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818"');
+    const result = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818"');
 
     expect(result.err.code).to.equal(1);
     expect(result.stderr).to.contain('Missing release version');
@@ -147,10 +195,28 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
 
-    const result = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result.err).to.be.null();
     expect(matchedRequests).to.have.length(2);
+    expect(unmatchedRequests).to.have.length(0);
+
+    const req = matchedRequests[1];
+    expect(req.method).to.equal('POST');
+    expect(req.headers).to.have.property('authorization', 'Token org:app:secret');
+    expect(req.body).to.equal('{"version":"1.0.3"}');
+  }));
+
+  it('should send a request through a proxy to create a release when HTTP_PROXY is set', mochaAsync(async () => {
+    addCliStatusMessage({ includeProxy: true });
+    addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
+    addExpectProxyRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
+
+    const result = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3', { env: 'NODE_TLS_REJECT_UNAUTHORIZED=0 HTTPS_PROXY="" HTTP_PROXY=http://username:password@localhost:9818' });
+
+    expect(result.err).to.be.null();
+    expect(matchedRequests).to.have.length(2);
+    expect(matchedProxyRequests).to.have.length(2);
     expect(unmatchedRequests).to.have.length(0);
 
     const req = matchedRequests[1];
@@ -163,7 +229,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
 
-    const result1 = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result1 = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result1.err).to.be.null();
     expect(matchedRequests).to.have.length(2);
@@ -173,7 +239,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
 
-    const result2 = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result2 = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result2.err).to.be.null();
     expect(matchedRequests).to.have.length(2);
@@ -184,7 +250,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
 
-    const result1 = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result1 = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result1.err).to.be.null();
     expect(matchedRequests).to.have.length(2);
@@ -194,7 +260,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 409 });
 
-    const result2 = await executeCommand('release -k org:app:secret --strict --apihost="http://localhost:8818" 1.0.3');
+    const result2 = await executeCommand('release -k org:app:secret --strict --apihost="https://localhost:8818" 1.0.3');
 
     expect(result2.err.code).to.equal(1);
     expect(result2.stderr).to.contain('Release already exists');
@@ -207,7 +273,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 400 });
 
-    const result = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result.err.code).to.equal(1);
     expect(result.stderr).to.contain('Could not create release');
@@ -240,14 +306,14 @@ describe('CLI dispatch tests', function cliTests() {
   }));
 
   it('should error if no path is provided', mochaAsync(async () => {
-    const result = await executeCommand('upload -k org:app:secret -r 1.0.2 --apihost="http://localhost:8818"');
+    const result = await executeCommand('upload -k org:app:secret -r 1.0.2 --apihost="https://localhost:8818"');
 
     expect(result.err.code).to.equal(1);
     expect(result.stderr).to.contain('Missing upload path');
   }));
 
   it('should error if no release is provided', mochaAsync(async () => {
-    const result = await executeCommand(`upload -k org:app:secret --apihost="http://localhost:8818" ${FIXTURE_PATH}`);
+    const result = await executeCommand(`upload -k org:app:secret --apihost="https://localhost:8818" ${FIXTURE_PATH}`);
 
     expect(result.err.code).to.equal(1);
     expect(result.stderr).to.contain('You must specify a release');
@@ -257,12 +323,12 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/1.0.2/artifacts/', {
       status: 200,
-      body: { signed_url: 'http://localhost:8818/upload/' },
+      body: { signed_url: 'https://localhost:8818/upload/' },
     });
 
     addExpectRequest('/upload/', { status: 200 });
 
-    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="http://localhost:8818" ${FIXTURE_PATH}`);
+    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="https://localhost:8818" ${FIXTURE_PATH}`);
 
     expect(result.err).to.be.null();
     expect(result.stdout).to.contain('Found 3 files');
@@ -298,12 +364,12 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/1.0.2/artifacts/', {
       status: 200,
-      body: { signed_url: 'http://localhost:8818/upload/' },
+      body: { signed_url: 'https://localhost:8818/upload/' },
     });
 
     addExpectRequest('/upload/', { status: 200 });
 
-    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="http://localhost:8818" ${FIXTURE_PATH}subdir/one.js`);
+    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="https://localhost:8818" ${FIXTURE_PATH}subdir/one.js`);
 
     expect(result.err).to.be.null();
     expect(result.stdout).to.contain('Found 1 file');
@@ -326,12 +392,12 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage();
     addExpectRequest('/v1/orgs/org/apps/app/releases/1.0.2/artifacts/', {
       status: 200,
-      body: { signed_url: 'http://localhost:8818/upload/' },
+      body: { signed_url: 'https://localhost:8818/upload/' },
     });
 
     addExpectRequest('/upload/', { status: 200 });
 
-    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="http://localhost:8818" ${FIXTURE_PATH}subdir/one.js ${FIXTURE_PATH}two.jsx`);
+    const result = await executeCommand(`upload -k org:app:secret -r 1.0.2 --apihost="https://localhost:8818" ${FIXTURE_PATH}subdir/one.js ${FIXTURE_PATH}two.jsx`);
 
     expect(result.err).to.be.null();
     expect(result.stdout).to.contain('Found 2 files');
@@ -360,7 +426,7 @@ describe('CLI dispatch tests', function cliTests() {
     addCliStatusMessage({ status: 400, message: 'Some error to show' });
     addExpectRequest('/v1/orgs/org/apps/app/releases/', { status: 200 });
 
-    const result = await executeCommand('release -k org:app:secret --apihost="http://localhost:8818" 1.0.3');
+    const result = await executeCommand('release -k org:app:secret --apihost="https://localhost:8818" 1.0.3');
 
     expect(result.err.code).to.equal(1);
     expect(result.stderr).to.contain('Some error to show');

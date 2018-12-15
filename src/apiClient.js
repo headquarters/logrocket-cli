@@ -1,5 +1,8 @@
 import 'isomorphic-fetch';
 import { version as cliVersion } from '../package.json';
+import HttpProxyAgent from 'http-proxy-agent';
+import HttpsProxyAgent from 'https-proxy-agent';
+import url from 'url';
 
 class ApiClient {
   constructor({
@@ -19,6 +22,24 @@ class ApiClient {
     };
   }
 
+  get agent() {
+    const proxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+
+    if (!proxy) {
+      return null;
+    }
+
+    const proxyParts = url.parse(proxy);
+
+    if (proxyParts.protocol === 'http:') {
+      return new HttpProxyAgent(proxy);
+    }
+
+    if (proxyParts.protocol === 'https:') {
+      return new HttpsProxyAgent(proxy);
+    }
+  }
+
   async _makeRequest({ url, data }) {
     const [orgSlug, appSlug] = this.apikey.split(':');
 
@@ -26,12 +47,14 @@ class ApiClient {
       method: 'POST',
       headers: this.headers,
       body: JSON.stringify(data),
+      agent: this.agent
     });
   }
 
   async checkStatus() {
     const res = await fetch(`${this.apihost}/cli/status/`, {
       headers: this.headers,
+      agent: this.agent
     });
 
     if (res.status === 204) {

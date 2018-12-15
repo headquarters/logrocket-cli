@@ -3,8 +3,16 @@ import apiClient from '../apiClient';
 
 describe('CLI apiClient tests', () => {
   let client;
+  const httpProxy = process.env.HTTP_PROXY;
+  const httpsProxy = process.env.HTTPS_PROXY;
+
+  before(() => {
+    delete process.env.HTTPS_PROXY;
+    process.env.HTTP_PROXY = 'http://username:password@proxydomain:9818';
+  });
 
   beforeEach(() => {
+
     client = apiClient({
       apikey: 'org:app:key',
       apihost: 'http://example.com',
@@ -13,6 +21,11 @@ describe('CLI apiClient tests', () => {
 
   afterEach(() => {
     fetchMock.restore();
+  });
+
+  after(() => {
+    process.env.HTTP_PROXY = httpProxy;
+    process.env.HTTPS_PROXY = httpsProxy;
   });
 
   it('should send a request to create a release', mochaAsync(async () => {
@@ -24,6 +37,21 @@ describe('CLI apiClient tests', () => {
 
     const opts = fetchMock.lastCall()[1];
     expect(opts.headers).to.have.property('Authorization', 'Token org:app:key');
+    expect(opts.body).to.equal('{"version":"1.0.2"}');
+  }));
+
+  it('should send a request to create a release with agent header when HTTP_PROXY is set', mochaAsync(async () => {
+    fetchMock.post('http://example.com/v1/orgs/org/apps/app/releases/', () => 200);
+    await client.createRelease({ version: '1.0.2' });
+
+    expect(fetchMock.calls().matched).to.have.length(1);
+    expect(fetchMock.calls().unmatched).to.have.length(0);
+
+    const opts = fetchMock.lastCall()[1];
+
+    expect(opts.headers).to.have.property('Authorization', 'Token org:app:key');
+    expect(opts.agent).to.exist;
+    expect(opts.agent.proxy.hostname).to.equal('proxydomain');
     expect(opts.body).to.equal('{"version":"1.0.2"}');
   }));
 
